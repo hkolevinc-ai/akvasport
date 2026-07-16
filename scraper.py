@@ -40,7 +40,7 @@ EU_RESPONSIBLE_PERSON = "AKVASPORT EOOD"
 SHIPPING_TEMPLATE = "Магазин"
 HANDLING_TIME = "1 Day"
 FULFILLMENT_CHANNEL = "I will ship this item myself"
-COUNTRY_OF_ORIGIN = "Mainland China"
+DEFAULT_COUNTRY_OF_ORIGIN = os.getenv("DEFAULT_COUNTRY_OF_ORIGIN", "Mainland China").strip()
 
 CATEGORY_NAMES = {
     "32474": "Sports & Outdoors / Hunting & Fishing / Fishing / Baits & Accessories / Bait Traps",
@@ -142,6 +142,8 @@ class Product:
     detail_images: list[str]
     attributes: dict[str, str]
     list_price_eur: Decimal | None
+    country_origin: str
+    country_origin_source: str
     variants: list[Variant]
 
 
@@ -437,54 +439,268 @@ def parse_list_price(soup: BeautifulSoup, base_price: Decimal | None) -> Decimal
 
 def infer_brand(title: str) -> str:
     known = [
-        "Yo-Zuri", "YO-ZURI", "Duel", "DUEL", "Owner", "Ragot", "Xesta", "SeaBuzz",
-        "Filstar", "Shimano", "Daiwa", "Rapala", "Westin", "Mepps", "Blue Fox",
-        "Storm", "Salmo", "DTD", "Shout", "Williamson", "Bait Breath", "Little Jack",
-        "Seafloor Control", "ZetZ", "Mustad", "VMC", "Hayabusa", "Acme", "Goldy",
+        "Yo Zuri", "Yo-Zuri", "YO-ZURI", "Duel", "DUEL", "Owner", "Ragot",
+        "Xesta", "SeaBuzz", "Filstar", "Shimano", "Daiwa", "Rapala", "Westin",
+        "Mepps", "Blue Fox", "Storm", "Salmo", "DTD", "Shout", "Williamson",
+        "Bait Breath", "Little Jack", "Seafloor Control", "ZetZ", "Mustad", "VMC",
+        "Hayabusa", "Acme", "Goldy",
     ]
     lower = title.lower()
     for brand in known:
         if brand.lower() in lower:
-            return brand
+            return "Yo-Zuri" if brand.lower() in {"yo zuri", "yo-zuri"} else brand
     first = re.split(r"\s+", title.strip())[0] if title.strip() else ""
     return first[:80]
 
 
 def classify_category(title: str, description: str) -> str:
-    text = f"{title} {description}".lower()
-    if re.search(r"\b(led|light|lamp|светещ|светлин|лампа)\b", text):
-        return "32479"
-    if re.search(r"\b(egg|eggs|яйц|хайвер|икра)\b", text):
-        return "32478"
-    if re.search(r"\b(trap|cage|капан|капани|кош за стръв|bait trap)\b", text):
+    # Classification is deliberately based mainly on the product title.
+    # Words such as "light", "aroma" or "scent" inside a lure description must not
+    # move a physical lure into Light Attractants or Attractants.
+    title_text = clean_text(title).lower()
+
+    if re.search(r"(?:bait\s*)?(?:trap|cage)|капан|капани|кош за стръв", title_text):
         return "32474"
-    if re.search(r"\b(attractant|атрактант|дип|аромат|спрей|scent|booster|flavour|flavor)\b", text):
+    if re.search(r"\b(?:egg|eggs|roe)\b|яйц|хайвер|икра", title_text):
+        return "32478"
+
+    light_device = (
+        re.search(r"(?:fish|fishing|bait|риболов|риба).{0,35}(?:led|lamp|light|лампа|светлин)", title_text)
+        or re.search(r"(?:led|lamp|light|лампа|светлин).{0,35}(?:attract|привлич|риболов|риба)", title_text)
+    )
+    if light_device:
+        return "32479"
+
+    attractant_product = re.search(
+        r"\b(?:attractant|dip|spray|booster|scent\s*(?:gel|spray|liquid)|flavou?r)\b"
+        r"|атрактант|дип|спрей|бустер|ароматизатор",
+        title_text,
+    )
+    if attractant_product:
         return "32477"
+
     return "32476"
 
 
-def material_values(title: str, description: str, category_id: str) -> tuple[str, str, str]:
-    text = f"{title} {description}".lower()
+COUNTRY_ALIASES = {
+    "Japan": ("japan", "japanese", "япония", "японски", "японско"),
+    "Mainland China": ("china", "made in china", "китай", "китайски"),
+    "Bulgaria": ("bulgaria", "българия", "български"),
+    "France": ("france", "франция", "френски"),
+    "Italy": ("italy", "италия", "италиански"),
+    "Germany": ("germany", "германия", "немски"),
+    "Finland": ("finland", "финландия", "финландски"),
+    "Sweden": ("sweden", "швеция", "шведски"),
+    "Norway": ("norway", "норвегия", "норвежки"),
+    "Denmark": ("denmark", "дания", "датски"),
+    "Poland": ("poland", "полша", "полски"),
+    "South Korea": ("south korea", "korea", "южна корея", "корея", "корейски"),
+    "Taiwan": ("taiwan", "тайван", "тайвански"),
+    "Vietnam": ("vietnam", "виетнам", "виетнамски"),
+    "Thailand": ("thailand", "тайланд", "тайландски"),
+    "Philippines": ("philippines", "филипини", "филипински"),
+    "Malaysia": ("malaysia", "малайзия", "малайзийски"),
+    "United States": ("united states", "usa", "u.s.a.", "сащ", "американски"),
+}
+
+
+def country_from_text(value: str, *, require_origin_context: bool = True) -> str | None:
+    text = clean_text(value).lower()
+    if not text:
+        return None
+
+    context_patterns = (
+        r"made\s+in",
+        r"manufactured\s+in",
+        r"country\s+of\s+origin",
+        r"произведен[а-я]*\s+в",
+        r"производство",
+        r"страна\s+на\s+произход",
+    )
+    windows: list[str] = []
+    for pattern in context_patterns:
+        for match in re.finditer(pattern, text):
+            windows.append(text[match.start() : match.end() + 90])
+
+    if require_origin_context and not windows:
+        return None
+    search_areas = windows or [text]
+
+    for area in search_areas:
+        for country, aliases in COUNTRY_ALIASES.items():
+            if any(alias in area for alias in aliases):
+                return country
+    return None
+
+
+def infer_country_origin(
+    title: str, description: str, attributes: dict[str, str]
+) -> tuple[str, str]:
+    for name, value in attributes.items():
+        if re.search(r"произход|country|origin|производство|manufactur", name, re.I):
+            country = country_from_text(value, require_origin_context=False)
+            if country:
+                return country, f"attribute: {name}"
+
+    country = country_from_text(description, require_origin_context=True)
+    if country:
+        return country, "explicit product description"
+
+    # The field is mandatory in the Temu template. When AkvaSport does not publish
+    # an explicit origin, use the configurable fallback and record this in the CSV/log.
+    return DEFAULT_COUNTRY_OF_ORIGIN, "configured fallback"
+
+
+MATERIAL_PATTERNS: list[tuple[str, str]] = [
+    ("Tungsten Steel", r"\b(?:tungsten)\b|волфрам"),
+    ("Lead", r"\blead\b|\bолово\b|\bоловна\s+глав|\bоловен\s+материал"),
+    ("Stainless Steel", r"stainless\s+steel|неръждаема\s+стомана"),
+    ("Carbon Steel", r"carbon\s+steel|въглеродна\s+стомана"),
+    ("Silicone", r"\bsilicone\b|силикон"),
+    ("Synthetic Rubber", r"synthetic\s+rubber|синтетичен\s+каучук"),
+    ("Rubber", r"\brubber\b|\bкаучук\b"),
+    ("PVC", r"\bpvc\b|поливинилхлорид"),
+    ("ABS", r"\babs\b|abs\s+resin|abs\s+смол"),
+    ("Resin", r"\bresin\b|\bсмола\b|смолен\s+материал"),
+    ("Zinc Alloy", r"zinc\s+alloy|цинкова\s+сплав"),
+    ("Copper Alloy", r"copper\s+alloy|медна\s+сплав"),
+    ("Aluminum Alloy", r"alumin(?:um|ium)\s+alloy|алуминиева\s+сплав"),
+    ("Iron", r"\biron\b|\bжелязо\b"),
+    ("PC", r"polycarbonate|поликарбонат"),
+    ("PE (polyethylene)", r"polyethylene|полиетилен"),
+    ("PA (polyamide, Nylon)", r"polyamide|полиамид|\bnylon\b|\bнайлон\b"),
+]
+
+
+def material_values(
+    title: str, description: str, attributes: dict[str, str], category_id: str
+) -> tuple[str, str, str]:
     if category_id == "32479":
         return "", "", ""
-    if "волфрам" in text or "tungsten" in text:
-        return "Tungsten Steel", "Stainless Steel", "Carbon Steel"
-    if "джиг" in text or "глава" in text or "lead" in text:
+
+    title_text = clean_text(title).lower()
+    intro_text = clean_text(description)[:900].lower()
+    attribute_text = " ".join(
+        f"{name} {value}" for name, value in attributes.items()
+    ).lower()
+    evidence_text = f"{title_text} {intro_text} {attribute_text}"
+
+    # First identify the actual product form. This prevents incidental words in the
+    # description (for example, a tungsten sinker used with silicone lures) from
+    # becoming the product's own material.
+    if re.search(r"волфрам|\btungsten\b", title_text):
+        return "Tungsten Steel", "Tungsten Steel", "Tungsten Steel"
+
+    if re.search(r"джиг\s*глав|jig\s*head|micro\s*jig|глав[аи]\s+за\s+(?:туистер|силикон)", title_text):
+        if re.search(r"волфрам|\btungsten\b", evidence_text):
+            return "Tungsten Steel", "Carbon Steel", "Stainless Steel"
         return "Lead", "Carbon Steel", "Stainless Steel"
-    if "силикон" in text or "silicone" in text or "soft bait" in text:
-        return "Silicone", "Synthetic Rubber", "PVC"
-    if "metal" in text or "блесна" in text or "пилкер" in text or "spinner" in text:
-        return "Stainless Steel", "Zinc Alloy", "Copper Alloy"
-    return "ABS", "Stainless Steel", "PC"
+
+    if re.search(r"силикон|soft\s*bait|soft\s*lure|shad|туистер", title_text):
+        if re.search(r"джиг\s*глав|jig\s*head", intro_text):
+            return "Silicone", "Lead", "Carbon Steel"
+        return "Silicone", "Silicone", "Silicone"
+
+    # Hybrid lures may not say "silicone" in the title, but the first product
+    # sentence clearly identifies both the soft body and integrated jig head.
+    if re.search(r"силикон|soft\s*bait|soft\s*lure", intro_text) and re.search(
+        r"джиг\s*глав|jig\s*head", intro_text
+    ):
+        return "Silicone", "Lead", "Carbon Steel"
+
+    if re.search(r"воблер|wobbler|minnow|crankbait|jerkbait", title_text):
+        return "ABS", "Resin", "Stainless Steel"
+
+    if re.search(r"клатушка|блесна|пилкер|metal\s*jig|spinner|spoon", title_text):
+        return "Stainless Steel", "Zinc Alloy", "Carbon Steel"
+
+    materials: list[str] = []
+    for material, pattern in MATERIAL_PATTERNS:
+        if re.search(pattern, evidence_text, flags=re.I) and material not in materials:
+            materials.append(material)
+
+    if category_id == "32474" and not materials:
+        materials = ["Stainless Steel", "PA (polyamide, Nylon)", "PE (polyethylene)"]
+    elif category_id in {"32477", "32478"} and not materials:
+        materials = ["Silicone", "PVC", "Rubber"]
+    elif not materials:
+        materials = ["ABS", "Stainless Steel", "Resin"]
+
+    while len(materials) < 3:
+        materials.append(materials[0])
+    return tuple(materials[:3])
 
 
-def parse_measure(attributes: dict[str, str], names: Iterable[str]) -> float | None:
+def parse_number(value: str) -> float | None:
+    match = re.search(r"(\d+(?:[.,]\d+)?)", clean_text(value))
+    return float(match.group(1).replace(",", ".")) if match else None
+
+
+def parse_weight_g(value: str) -> float | None:
+    text = clean_text(value).lower()
+    number = parse_number(text)
+    if number is None:
+        return None
+    if re.search(r"(?:kg)(?:\b|$)|килограм", text):
+        return number * 1000
+    if re.search(r"(?:mg)(?:\b|$)|милиграм", text):
+        return number / 1000
+    if re.search(r"(?:gr|g|гр)(?:\b|$)|грам", text):
+        return number
+    return None
+
+
+def parse_length_cm(value: str) -> float | None:
+    text = clean_text(value).lower()
+    number = parse_number(text)
+    if number is None:
+        return None
+    if re.search(r"(?:mm)(?:\b|$)|милимет", text):
+        return number / 10
+    if re.search(r"(?:cm|см)(?:\b|$)|сантимет", text):
+        return number
+    if re.search(r"(?:m)(?:\b|$)|метър|метра", text):
+        return number * 100
+    return None
+
+
+def parse_attribute_measure(
+    attributes: dict[str, str], names: Iterable[str], parser
+) -> float | None:
     for name, value in attributes.items():
         if any(key.lower() in name.lower() for key in names):
-            match = re.search(r"(\d+(?:[.,]\d+)?)", value)
-            if match:
-                return float(match.group(1).replace(",", "."))
+            parsed = parser(value)
+            if parsed is not None:
+                return parsed
     return None
+
+
+def parse_named_measure(text: str, labels: Iterable[str], parser) -> float | None:
+    clean = clean_text(text)
+    for label in labels:
+        match = re.search(
+            rf"{re.escape(label)}\s*[:\-]?\s*(\d+(?:[.,]\d+)?\s*(?:kg|mg|g|gr|гр|mm|cm|см|m)\b)",
+            clean,
+            flags=re.I,
+        )
+        if match:
+            parsed = parser(match.group(1))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def parse_first_unit_measure(text: str, parser, units: str) -> float | None:
+    match = re.search(rf"(\d+(?:[.,]\d+)?\s*(?:{units})(?:\b|$))", clean_text(text), flags=re.I)
+    return parser(match.group(1)) if match else None
+
+
+def parse_model_length_cm(title: str) -> float | None:
+    # Common hard-bait model names encode length in millimetres: 130F, 125S, 90SP.
+    if not re.search(r"воблер|wobbler|minnow|crankbait|jerkbait", title, flags=re.I):
+        return None
+    match = re.search(r"(?<!\d)(\d{2,3})(?:F|S|SP)(?:\b|\s|$)", title, flags=re.I)
+    return round(float(match.group(1)) / 10, 2) if match else None
 
 
 def bullets_from(product: Product) -> list[str]:
@@ -575,6 +791,13 @@ def parse_product(session: requests.Session, url: str) -> Product:
         ]
 
     category_id = classify_category(title, description)
+    country_origin, country_origin_source = infer_country_origin(title, description, attributes)
+    if country_origin_source == "configured fallback":
+        logger.warning(
+            "Country of origin not published for %s; using fallback %s",
+            title,
+            country_origin,
+        )
     product = Product(
         url=url,
         title=title,
@@ -586,6 +809,8 @@ def parse_product(session: requests.Session, url: str) -> Product:
         detail_images=all_images[:100],
         attributes=attributes,
         list_price_eur=list_price,
+        country_origin=country_origin,
+        country_origin_source=country_origin_source,
         variants=variants,
     )
     product.bullets = bullets_from(product)
@@ -647,17 +872,63 @@ def append_images(ws, row: int, start_col: str, images: list[str], max_images: i
         ws.cell(row=row, column=start + offset, value=url)
 
 
-def product_dimensions(product: Product, variant: Variant) -> tuple[float, float, float, float]:
-    explicit_weight = parse_measure(product.attributes, ("тегло", "weight"))
-    explicit_length = parse_measure(product.attributes, ("дължина", "length"))
-    explicit_width = parse_measure(product.attributes, ("ширина", "width"))
-    explicit_height = parse_measure(product.attributes, ("височина", "height", "дебелина"))
+def product_dimensions(
+    product: Product, variant: Variant
+) -> tuple[float, float, float, float, list[str]]:
+    option_text = " ".join(variant.option_values.values())
 
-    weight = explicit_weight or variant.weight_g or 10.0
-    length = explicit_length or 10.0
-    width = explicit_width or max(1.0, min(10.0, length * 0.25))
-    height = explicit_height or max(1.0, min(5.0, width * 0.6))
-    return round(weight, 2), round(length, 2), round(width, 2), round(height, 2)
+    weight = (
+        parse_attribute_measure(product.attributes, ("тегло", "weight"), parse_weight_g)
+        or parse_named_measure(product.description, ("тегло", "weight"), parse_weight_g)
+        or parse_first_unit_measure(
+            option_text, parse_weight_g, r"kg|mg|gr|g|гр|грам(?:а|ове)?"
+        )
+        or variant.weight_g
+        or parse_first_unit_measure(
+            product.title, parse_weight_g, r"kg|mg|gr|g|гр|грам(?:а|ове)?"
+        )
+    )
+    length = (
+        parse_attribute_measure(product.attributes, ("дължина", "length"), parse_length_cm)
+        or parse_named_measure(product.description, ("дължина", "length"), parse_length_cm)
+        or parse_first_unit_measure(option_text, parse_length_cm, r"mm|cm|см|m")
+        or parse_first_unit_measure(product.title, parse_length_cm, r"mm|cm|см|m")
+        or parse_model_length_cm(product.title)
+    )
+    width = (
+        parse_attribute_measure(product.attributes, ("ширина", "width"), parse_length_cm)
+        or parse_named_measure(product.description, ("ширина", "width"), parse_length_cm)
+    )
+    height = (
+        parse_attribute_measure(
+            product.attributes, ("височина", "height", "дебелина", "thickness"), parse_length_cm
+        )
+        or parse_named_measure(
+            product.description, ("височина", "height", "дебелина", "thickness"), parse_length_cm
+        )
+    )
+
+    fallbacks: list[str] = []
+    if weight is None:
+        weight = 10.0
+        fallbacks.append("weight_g")
+    if length is None:
+        length = 10.0
+        fallbacks.append("length_cm")
+    if width is None:
+        width = 1.0
+        fallbacks.append("width_cm")
+    if height is None:
+        height = 1.0
+        fallbacks.append("height_cm")
+
+    return (
+        round(weight, 2),
+        round(length, 2),
+        round(width, 2),
+        round(height, 2),
+        fallbacks,
+    )
 
 
 def fill_template(products: list[Product]) -> None:
@@ -676,10 +947,14 @@ def fill_template(products: list[Product]) -> None:
     raw_rows: list[dict] = []
 
     for product in products:
-        mat1, mat2, mat3 = material_values(product.title, product.description, product.category_id)
+        mat1, mat2, mat3 = material_values(
+            product.title, product.description, product.attributes, product.category_id
+        )
         for variant in product.variants:
             theme, sale_cells = variation_theme_and_cells(variant)
-            weight_g, length_cm, width_cm, height_cm = product_dimensions(product, variant)
+            weight_g, length_cm, width_cm, height_cm, dimension_fallbacks = product_dimensions(
+                product, variant
+            )
             parent = safe_sku(product.parent_sku, f"AKVA-{output_row}")
             sku = safe_sku(variant.sku, f"{parent}-{output_row}")
             primary_image = (variant.image_urls or product.detail_images or [""])[0]
@@ -713,7 +988,7 @@ def fill_template(products: list[Product]) -> None:
                 "GL": SHIPPING_TEMPLATE,
                 "GM": HANDLING_TIME,
                 "GN": FULFILLMENT_CHANNEL,
-                "GP": COUNTRY_OF_ORIGIN,
+                "GP": product.country_origin,
                 "IQ": sku,
                 "IR": MANUFACTURER,
                 "IS": EU_RESPONSIBLE_PERSON,
@@ -757,6 +1032,12 @@ def fill_template(products: list[Product]) -> None:
                     "main_image": primary_image,
                     "all_images": " | ".join(variant.image_urls or product.detail_images),
                     "description": product.description,
+                    "major_material_1": mat1,
+                    "major_material_2": mat2,
+                    "major_material_3": mat3,
+                    "country_origin": product.country_origin,
+                    "country_origin_source": product.country_origin_source,
+                    "dimension_fallbacks": " | ".join(dimension_fallbacks),
                     "manufacturer": MANUFACTURER,
                     "eu_responsible_person": EU_RESPONSIBLE_PERSON,
                 }
@@ -816,11 +1097,14 @@ def main() -> int:
             product = parse_product(session, url)
             products.append(product)
             logger.info(
-                "Parsed %d/%d: %s (%d variants)",
+                "Parsed %d/%d: %s (%d variants, category=%s, origin=%s [%s])",
                 index,
                 len(urls),
                 product.title,
                 len(product.variants),
+                product.category_id,
+                product.country_origin,
+                product.country_origin_source,
             )
         except Exception as exc:  # keep the run useful if one product is malformed
             logger.exception("Failed product %s", url)
