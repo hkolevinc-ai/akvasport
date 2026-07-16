@@ -1,0 +1,54 @@
+name: AkvaSport scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      product_limit:
+        description: "Брой основни продукти за сканиране (0 = всички)"
+        required: true
+        default: "10"
+      category_url:
+        description: "URL на категорията"
+        required: true
+        default: "https://akvasport.com/category/291/primamki.html"
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          PRODUCT_LIMIT: ${{ inputs.product_limit }}
+          CATEGORY_URL: ${{ inputs.category_url }}
+          REQUEST_DELAY: "1.2"
+          DEFAULT_IN_STOCK_QTY: "1"
+        run: python scraper.py
+
+      - name: Upload generated files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: akvasport-results-${{ github.run_number }}
+          path: |
+            output/TEMU_AKVASPORT_UPLOAD.xlsx
+            output/akvasport_raw_export.csv
+            output/scraper.log
+          if-no-files-found: warn
+          retention-days: 14
